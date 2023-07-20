@@ -1,7 +1,9 @@
 #####################################################################################
-# Leverage supply chains in the carbon footprints of production and consumption in UK
+# Tracing carbon footprints to intermediate industries in the United Kingdom
 #####################################################################################
 
+
+# Loading all libaries
 library(tidyverse)
 library(openxlsx)
 #install.packages('rmatio')
@@ -27,14 +29,14 @@ Agg <- function(x,aggkey,dim)
   
   return(x)
 }
-# Set paths 
+
+# Set paths to the MRIO model and other inputs as well as the result folder 
 path <- list("EXIO" = paste0("W:/WU/Projekte/GRU/04_Daten/MRIO/EXIOBASE/EXIOBASE 3.8/IOT_pxp/","IOT_",year,"_pxp/") ,
              "input" = paste0( getwd(),"/input/"),
              "output" = paste0( getwd(),"/output/") )
 
 
 ### Import labels and codes ###
-
 code <- list( "F" = read.delim( paste0( path$EXIO, "impacts/unit.txt"), header = TRUE, stringsAsFactors = FALSE), 
               "Z" = read.delim( paste0( path$EXIO, "unit.txt"), header = TRUE, stringsAsFactors = FALSE),
               "FinalDemand" = read.delim( paste0( path$EXIO, "finaldemands.txt"), header = TRUE, stringsAsFactors = FALSE),
@@ -43,7 +45,6 @@ code <- list( "F" = read.delim( paste0( path$EXIO, "impacts/unit.txt"), header =
               "Groups" = read.xlsx( paste0(path$input, "IPCC product group concordance and GHG scope classification.xlsx" ) ) )
 
 # Merge/transform/add labels/codes for better handling aggregation steps and processing
-
 code$Z <- left_join( code$Z, code$Groups, by = "sector" )
 code$Z$index <- 1:nrow(code$Z)
 
@@ -58,7 +59,7 @@ code[["Y"]] <- data.frame("index" = 1:ncol(Y),
 
 code$F["index"] <- 1:nrow(code$F)
 
-# Re-define regions for aggregation
+# Re-define regions for aggregation (UK, EU, RoW)
 code[["regionAgg"]] <- code$region
 
 code$regionAgg$name[29:49] <- 'ROW'
@@ -70,7 +71,6 @@ code[["UK"]] <- code$Z$index[ code$Z$region == "GB"]
 
 
 ### Import MRIO model ###
-
 # Technology matrix
 A <- read.delim( paste0( path$EXIO, "A.txt"), header = FALSE, skip = 3, stringsAsFactors = FALSE)[,c(-1,-2)]
 A <- as.matrix(A)
@@ -99,8 +99,7 @@ L <- solve( diag(9800) - A )
 Y <- Agg(x = Y, dim = 2, aggkey = code$Y$region)
 Y <- Y[, code$region$index[ code$region$name == 'GB'] ]
 
-### Select stressor and start calculation ###
-
+### Select stressors and start calculation ###
 stressor <- data.frame("index" = c(1,4,2), 
                        "name" = c("Value","Carbon","Employment"), 
                        stringsAsFactors = FALSE )
@@ -136,7 +135,7 @@ for( str in 1:nrow(stressor) )
   
   # Start calculation #1XPLD (flows embodied in intermediates layer 1+) --------------------
   
-  
+  # Create empty data frame to store results in
   result <- data.frame("index" = 1:(3*200*3*200*200),
                        "source.region" = rep(c("EU","GB","ROW"), each = 200),
                        "source.product" = code$Products$Name,
@@ -200,13 +199,12 @@ for( str in 1:nrow(stressor) )
   
   ### Start calculation #2XPLD (classic PLD) ###
   
+  # Set up data frame for storing production layer results
   reg <- 3
   ind <- 200
   lay_max <- 2
   lay <- lay_max + 2
   layers <- c("0","1","2","3+")
-  
-  # setup storage
   
   result <- data.frame("index" = 1:(lay*ind*ind*reg),
                        "source.region" = rep(c("EU","GB","ROW"),each = 200),
@@ -224,13 +222,18 @@ for( str in 1:nrow(stressor) )
   
   result$Scope[result$layer == "0"] <- "Scope 1"   # Layer 0 emissions are by definition scope 0
   
+  # Set up object for calculating the cumulative production layer emissions (from 0 to 2)
+  # This is required to calculate the residual term (Layers 3+) at the end of the calculus 
   A.sum <- FALSE
   
-  # Layer 0:
+  ## Layer 0:
+  
+  # Layer zero mulitplier equals the direct intensities. diag(49*200) stands for the identity matrix
   MP <- diag(49*200)*Q
   
   FP <- t( t(MP) * x )
   
+  # Aggregate the resulting flow matrix across regions. We are only interested in UK, EU and RoW
   FP <- Agg(x = FP,
             aggkey = paste0(rep(code$regionAgg$name,each = 200),"-",1:200),
             dim = 2)
@@ -239,19 +242,21 @@ for( str in 1:nrow(stressor) )
             aggkey = paste0(rep(code$regionAgg$name,each = 200),"-",1:200),
             dim = 1)
   
-  
+  # Select only the embodied GHG flows that are destined for gross production in UK sectors
   FP <- FP[, colnames(FP) %in%  paste0("GB","-",1:200) ]
   
 
-  
+  # Write numbers to result file
   result$value[result$layer == "0"] <- FP
   
   
-  # Layer 1:
+  ## Layer 1:
+  # Calculate layer 1 intensities
   MP <- A*Q
   
   FP <- t( t(MP)*x )
   
+  # Aggregate the resulting flow matrix across regions. We are only interested in UK, EU and RoW
   FP <- Agg(x = FP,
             aggkey = paste0(rep(code$regionAgg$name,each = 200),"-",1:200),
             dim = 2)
@@ -260,26 +265,40 @@ for( str in 1:nrow(stressor) )
             aggkey = paste0(rep(code$regionAgg$name,each = 200),"-",1:200),
             dim = 1)
   
-  
+  # Select only the embodied GHG flows that are destined for gross production in UK sectors
   FP <- FP[, colnames(FP) %in%  paste0("GB","-",1:200) ]
   
-  
+  # Write numbers to result file
   result$value[result$layer == "1"] <- FP
   
+  
   B <- A
+  
+  # Sum up the intermediate inputs of all layers that have been calculated so far (needed for residual term at the end)
+  # Please recall the power series expansion
   A.sum <- diag(200*49)+A
   
+  # The following loop allows for PLD across an arbitrary number of layers. For the paper by Ivanova and Wieland, we only go to layer 3 
+  
+  # Setting maximum layer
   l <- 3
   for(l in 3:(lay_max+1) )
   {
     print(layers[l])
+    
+    # Calculate intermediate inputs stemming from layer l
     B <- B%*%A
+    
+    # Sum up the intermediate inputs for estimating residual term at the end of the loop
     A.sum <- A.sum + B
     
+    # Estimate embodied emission intensities
     MP <- B*Q
     
+    # calculate flows of embodied emissions
     FP <- t( t(MP) * x )
     
+    # Aggregate the resulting flow matrix across regions. We are only interested in UK, EU and RoW
     FP <- Agg(x = FP,
               aggkey = paste0(rep(code$regionAgg$name,each = 200),"-",1:200),
               dim = 2)
@@ -288,20 +307,22 @@ for( str in 1:nrow(stressor) )
               aggkey = paste0(rep(code$regionAgg$name,each = 200),"-",1:200),
               dim = 1)
     
-    
+    # Select only the embodied GHG flows that are destined for gross production in UK sectors
     FP <- FP[, colnames(FP) %in%  paste0("GB","-",1:200) ]
     
+    # Write numbers into results file
     result$value[result$layer == layers[l]] <- FP
   }
   
-  
+  # Calculate the residual term (recall power series expansion)
   L.rest <- L - A.sum
   
-  
+  # Estimate embodied emission intensities that reflect only the residual term
   MP <- L.rest*Q
   
   FP <- t( t(MP) * x )
   
+  # Aggregate the resulting flow matrix across regions. We are only interested in UK, EU and RoW
   FP <- Agg(x = FP,
             aggkey = paste0(rep(code$regionAgg$name,each = 200),"-",1:200),
             dim = 2)
@@ -310,18 +331,20 @@ for( str in 1:nrow(stressor) )
             aggkey = paste0(rep(code$regionAgg$name,each = 200),"-",1:200),
             dim = 1)
   
-  
+  # Select only the embodied GHG flows that are destined for gross production in UK sectors
   FP <- FP[, colnames(FP) %in%  paste0("GB","-",1:200) ]
   
   l <- l +1
   
+  # Write results int data frame
   result$value[result$layer == layers[l]] <- FP
   
   sum(result$value)
   
+  # Filter only non-zero values
   export <- result[result$value != 0,]
   
-  
+  # Write results to folder
   write.table(export,
               file = paste0(path$output,stressor$name[str],"_XPLD_Source-Destination_UK_",year,".txt"),
               sep = "§",
@@ -330,6 +353,7 @@ for( str in 1:nrow(stressor) )
   
   ### Calculate Footprints of Production and Consumption ###
   
+  # Create data frame for storing results
   result <- data.frame("index" = 1:(3*200*200),
                        "source.region" = rep( c("EU","GB","ROW"), each = 200),
                        "source.product" = code$Products$Name,
@@ -345,6 +369,7 @@ for( str in 1:nrow(stressor) )
   
   FP <- t( t(L*Q)*x )
   
+  # Aggregate the resulting flow matrix across regions. We are only interested in UK, EU and RoW
   FP <- Agg(x = FP,
             aggkey = paste0(rep(code$regionAgg$name,each = 200),"-",1:200),
             dim = 2)
@@ -353,18 +378,19 @@ for( str in 1:nrow(stressor) )
             aggkey = paste0(rep(code$regionAgg$name,each = 200),"-",1:200),
             dim = 1)
   
-  
+  # Select only the embodied GHG flows that are destined for gross production in UK sectors
   FP <- FP[, colnames(FP) %in%  paste0("GB","-",1:200) ]
   sum(FP)
   
+  # Write results to file
   result$value_destination_production_X <- c(FP)
   sum(result$value_destination_production_X)
   
   
-  # Calculate Consumption Footprint
-  
+  ### Calculate Consumption Footprint
   FP <- t( t(L*Q)*Y )
   
+  # Aggregate the resulting flow matrix across regions. We are only interested in UK, EU and RoW
   FP <- Agg(x = FP,
             aggkey = paste0(rep(code$regionAgg$name,each = 200),"-",1:200),
             dim = 2)
@@ -378,9 +404,11 @@ for( str in 1:nrow(stressor) )
   
   sum(FP)
   
+  # Write numbers to file
   result$value_final_consumption_Y <- c(FP)
   sum(result$value_final_consumption_Y)
   
+  # Write results to folder
   write.table(result,
               file = paste0(path$output,stressor$name[str],"_Footprints of Production (X) and Consumption(Y)_UK_",year,".txt"),
               sep = "§",
